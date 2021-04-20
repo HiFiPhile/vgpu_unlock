@@ -6,7 +6,8 @@
 # This file is part of the "vgpu_unlock" project, and is distributed under the MIT License.
 # See the LICENSE file for more details.
 #
-
+# Contributions from Krutav Shah and the vGPU Unlocking community included :)
+#
 
 import errno
 import frida
@@ -17,6 +18,17 @@ import sys
 import time
 
 script_source = r"""
+    var syslog_func = new NativeFunction(Module.getExportByName(null, "syslog"),
+                                         "void",
+                                         ["int", "pointer", "...", "pointer"]);
+
+    var syslog = function(message) {
+        var format_ptr = Memory.allocUtf8String("%s");
+        var message_ptr = Memory.allocUtf8String(message);
+        syslog_func(5, format_ptr, message_ptr);
+    };
+
+
     // Value of the "request" argument used by nvidia-vgpud and nvidia-vgpu-mgr
     // when calling ioctl to read the PCI device ID and type (and possibly
     // other things) from the GPU.
@@ -53,6 +65,7 @@ script_source = r"""
     // 0.1s then 1s then 10s) then issue the same ioctl call again until the
     // status differs from 3. It will attempt this for up to 24h before giving
     // up.
+    var STATUS_OK = 0;
     var STATUS_TRY_AGAIN = 3;
 
     Interceptor.attach(Module.getExportByName(null, "ioctl"), {
@@ -93,49 +106,44 @@ script_source = r"""
                 var spoofed_devid = actual_devid;
                 var actual_subsysid = subsysid_ptr.readU16();
                 var spoofed_subsysid = actual_subsysid;
+                
+                // Maxwell
+                if(0x1340 <= actual_devid && actual_devid <= 0x13bd ||
+                   0x174d <= actual_devid && actual_devid <= 0x179c) {
+                    spoofed_devid = 0x13bd; // Tesla M10
+                    spoofed_subsysid = 0x1160;
+                }
 
-                // GP102
-                if(actual_devid == 0x1b00 || // TITAN X (Pascal)
-                   actual_devid == 0x1b02 || // TITAN Xp
-                   actual_devid == 0x1b06 || // GTX 1080 Ti
-                   actual_devid == 0x1b30) { // Quadro P6000
+                // Maxwell 2.0
+                if(0x13c0 <= actual_devid && actual_devid <= 0x1436 ||
+                   0x1617 <= actual_devid && actual_devid <= 0x1667 ||
+                   0x17c2 <= actual_devid && actual_devid <= 0x17fd) {
+                    spoofed_devid = 0x13f2; // Tesla M60
+                }
+
+                // Pascal
+                if(0x15f0 <= actual_devid && actual_devid <= 0x15f1 ||
+                   0x1b00 <= actual_devid && actual_devid <= 0x1d56 ||
+                   0x1725 <= actual_devid && actual_devid <= 0x172f) {
                     spoofed_devid = 0x1b38; // Tesla P40
                 }
 
-                // GP104
-                if(actual_devid == 0x1b80 || // GTX 1080
-                   actual_devid == 0x1b81 || // GTX 1070
-                   actual_devid == 0x1b82 || // GTX 1070 Ti
-                   actual_devid == 0x1b83 || // GTX 1060 6GB
-                   actual_devid == 0x1b84 || // GTX 1060 3GB
-                   actual_devid == 0x1bb0) { // Quadro P5000
-                    spoofed_devid = 0x1bb3; // Tesla P4
+                // GV100 Volta
+                if(actual_devid == 0x1d81 || // TITAN V
+                   actual_devid == 0x1dba) { // Quadro GV100 32GB
+                    spoofed_devid = 0x1db6; // Tesla V100 32GB PCIE
                 }
 
-                // TU102
-                if(actual_devid == 0x1e02 || // TITAN RTX
-                   actual_devid == 0x1e04 || // RTX 2080 Ti
-                   actual_devid == 0x1e07) { // RTX 2080 Ti Rev. A
+                // Turing
+                if(0x1e02 <= actual_devid && actual_devid <= 0x1ff9 ||
+                   0x2182 <= actual_devid && actual_devid <= 0x21d1) {
                     spoofed_devid = 0x1e30; // Quadro RTX 6000
                     spoofed_subsysid = 0x12ba;
                 }
 
-                // TU104
-                if(actual_devid == 0x1e81 || // RTX 2080 Super
-                   actual_devid == 0x1e82 || // RTX 2080
-                   actual_devid == 0x1e84 || // RTX 2070 Super
-                   actual_devid == 0x1e87 || // RTX 2080 Rev. A
-                   actual_devid == 0x1e89 || // RTX 2060
-                   actual_devid == 0x1eb0 || // Quadro RTX 5000
-                   actual_devid == 0x1eb1) { // Quadro RTX 4000
-                    spoofed_devid = 0x1eb8; // Tesla T4
-                }
-
-                // GA102
-                if(actual_devid == 0x2204 || // RTX 3090
-                   actual_devid == 0x2205 || // RTX 3080 Ti
-                   actual_devid == 0x2206) { // RTX 3080
-                    spoofed_devid = 0x2235; // RTX A40
+                // Ampere
+                if(0x2200 <= actual_devid && actual_devid <= 0x2600) {
+                    spoofed_devid = 0x2230; // RTX A6000
                 }
 
                 devid_ptr.writeU16(spoofed_devid);
@@ -147,8 +155,27 @@ script_source = r"""
                 var dev_type_ptr = this.argp.add(0x10).readPointer();
                 dev_type_ptr.writeU64(DEV_TYPE_VGPU_CAPABLE);
             }
+
+            if(status != STATUS_OK) {
+                // Things seems to work fine even if some operations that fail
+                // result in failed assertions. So here we change the status
+                // value for these cases to cleanup the logs for nvidia-vgpu-mgr.
+                if(op_type == 0xA0820104 ||
+                   op_type == 0x90960103) {
+                    this.argp.add(0x1C).writeU32(STATUS_OK);
+                } else {
+                    syslog("op_type: 0x" + op_type.toString(16) + " failed.");
+                }
+            }
+
+            // Workaround for some Maxwell cards not supporting reading inforom.
+            if(op_type == 0x2080014b && status == 0x56) {
+                this.argp.add(0x1C).writeU32(0x57);
+            }
         }
     });
+
+    syslog("vgpu_unlock loaded.");
 """
 
 device = frida.get_local_device()
@@ -205,7 +232,7 @@ def main():
         exit()
 
     device.on("child-added", on_child_added)
-    pid = device.spawn(sys.argv[2])
+    pid = device.spawn(["/bin/bash", "-c", ' '.join(sys.argv[2:])])
     instrument(pid)
 
     # Wait for everything to terminate before exiting.
